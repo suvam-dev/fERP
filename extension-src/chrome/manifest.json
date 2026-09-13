@@ -7,8 +7,17 @@
     "permissions": ["scripting", "activeTab"],
 
     "host_permissions": [
-        "*://erp.iitkgp.ac.in/IIT_ERP*/*",
+        "*://erp.iitkgp.ac.in/*",
+        "https://cdn.jsdelivr.net/*",
+        "https://tessdata.projectnaptha.com/*",
         "https://gymkhana.iitkgp.ac.in/api/ecs"
+    ],
+
+    "web_accessible_resources": [
+        {
+            "resources": ["libs/*"],
+            "matches": ["*://erp.iitkgp.ac.in/*"]
+        }
     ],
 
     "action": {

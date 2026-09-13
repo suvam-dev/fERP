@@ -385,14 +385,153 @@ browser.runtime
             }
         };
 
+        const solveCaptchaLocally = async (captchaImage) => {
+            if (typeof Tesseract === "undefined") {
+                return "";
+            }
+            try {
+                if (!captchaImage.complete || captchaImage.naturalWidth === 0) {
+                    await new Promise((resolve) => {
+                        captchaImage.onload = resolve;
+                        captchaImage.onerror = resolve;
+                        setTimeout(resolve, 1500);
+                    });
+                }
+
+                const width =
+                    captchaImage.naturalWidth || captchaImage.width || 150;
+                const height =
+                    captchaImage.naturalHeight || captchaImage.height || 50;
+
+                const canvas = document.createElement("canvas");
+                const ctx = canvas.getContext("2d", { willReadFrequently: true });
+                canvas.width = width;
+                canvas.height = height;
+                ctx.drawImage(captchaImage, 0, 0, width, height);
+
+                // Preprocessing: Thresholding + Dilation + Median Filter
+                const imgData = ctx.getImageData(0, 0, width, height);
+                const pixelData = imgData.data;
+
+                const darknessThreshold = 140;
+                for (let i = 0; i < pixelData.length; i += 4) {
+                    const r = pixelData[i],
+                        g = pixelData[i + 1],
+                        b = pixelData[i + 2];
+                    const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+                    const isText = luminance < darknessThreshold;
+                    pixelData[i] =
+                        pixelData[i + 1] =
+                        pixelData[i + 2] =
+                            isText ? 0 : 255;
+                    pixelData[i + 3] = 255;
+                }
+
+                // Dilation (thickening characters)
+                const thickenedData = new Uint8ClampedArray(pixelData.length);
+                for (let i = 0; i < pixelData.length; i += 4) {
+                    thickenedData[i + 3] = 255;
+                    if (pixelData[i] === 0) {
+                        thickenedData[i] =
+                            thickenedData[i + 1] =
+                            thickenedData[i + 2] =
+                                0;
+                        continue;
+                    }
+                    let isNeighborBlack = false;
+                    const x = (i / 4) % width;
+                    const y = Math.floor(i / 4 / width);
+                    for (let j = -1; j <= 1; j++) {
+                        for (let k = -1; k <= 1; k++) {
+                            if (j === 0 && k === 0) continue;
+                            const nX = x + k,
+                                nY = y + j;
+                            if (nX >= 0 && nX < width && nY >= 0 && nY < height) {
+                                if (pixelData[(nY * width + nX) * 4] === 0) {
+                                    isNeighborBlack = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (isNeighborBlack) break;
+                    }
+                    thickenedData[i] =
+                        thickenedData[i + 1] =
+                        thickenedData[i + 2] =
+                            isNeighborBlack ? 0 : 255;
+                }
+
+                // Median Filter for noise reduction
+                const finalPixelData = new Uint8ClampedArray(pixelData.length);
+                for (let i = 0; i < pixelData.length; i += 4) {
+                    const x = (i / 4) % width;
+                    const y = Math.floor(i / 4 / width);
+                    const neighbors = [];
+                    for (let j = -1; j <= 1; j++) {
+                        for (let k = -1; k <= 1; k++) {
+                            const nX = x + k,
+                                nY = y + j;
+                            if (nX >= 0 && nX < width && nY >= 0 && nY < height) {
+                                neighbors.push(thickenedData[(nY * width + nX) * 4]);
+                            }
+                        }
+                    }
+                    neighbors.sort((a, b) => a - b);
+                    const medianValue =
+                        neighbors[Math.floor(neighbors.length / 2)];
+                    finalPixelData[i] =
+                        finalPixelData[i + 1] =
+                        finalPixelData[i + 2] =
+                            medianValue;
+                    finalPixelData[i + 3] = 255;
+                }
+                ctx.putImageData(new ImageData(finalPixelData, width, height), 0, 0);
+
+                let worker;
+                try {
+                    worker = await Tesseract.createWorker("eng");
+                    await worker.setParameters({
+                        tessedit_char_whitelist:
+                            "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+                        tessedit_pageseg_mode: "7",
+                    });
+                    const {
+                        data: { text },
+                    } = await worker.recognize(canvas);
+                    let cleaned = (text || "")
+                        .trim()
+                        .replace(/[^a-zA-Z0-9]/g, "")
+                        .toUpperCase();
+                    if (cleaned.length > 6) {
+                        cleaned = cleaned.substring(0, 6);
+                    }
+                    return cleaned;
+                } finally {
+                    if (worker) {
+                        await worker.terminate();
+                    }
+                }
+            } catch (err) {
+                console.warn("[fERP] Local OCR failed, trying fallback:", err);
+                return "";
+            }
+        };
+
         const solveCaptcha = async (doc) => {
             try {
                 const captchaImage = doc.querySelector(
                     "#captchaImg, img[src*='captcha']"
                 );
                 if (!captchaImage) return "";
-                const captchaImageSrc = captchaImage.src;
 
+                // 1. Primary: Fast, 100% free local in-browser OCR
+                const localResult = await solveCaptchaLocally(captchaImage);
+                if (localResult && localResult.length >= 4) {
+                    return localResult;
+                }
+
+                // 2. Fallback: TSG Gymkhana ECS API (if online and applicable)
+                const captchaImageSrc = captchaImage.src;
                 const imageSrcArray = captchaImageSrc.split("/");
                 const captchaMagic = imageSrcArray[imageSrcArray.length - 1];
                 const cookieVal =
@@ -405,9 +544,9 @@ browser.runtime
                 const url = `https://gymkhana.iitkgp.ac.in/api/ecs/${captchaMagic}/${erpMagic}`;
 
                 const captchaResponse = await fetch(url);
-                if (!captchaResponse.ok) return "";
+                if (!captchaResponse.ok) return localResult || "";
                 const captchaResult = await captchaResponse.json();
-                return captchaResult.captcha || "";
+                return captchaResult.captcha || localResult || "";
             } catch (e) {
                 console.warn("[fERP] Captcha API error:", e);
                 return "";

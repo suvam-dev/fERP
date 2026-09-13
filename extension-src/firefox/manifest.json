@@ -7,8 +7,13 @@
 
     "permissions": [
         "activeTab",
-        "*://erp.iitkgp.ac.in/IIT_ERP*/*",
+        "*://erp.iitkgp.ac.in/*",
+        "https://cdn.jsdelivr.net/*",
+        "https://tessdata.projectnaptha.com/*",
         "https://gymkhana.iitkgp.ac.in/api/ecs"
+    ],
+    "web_accessible_resources": [
+        "libs/*"
     ],
 
     "browser_action": {
