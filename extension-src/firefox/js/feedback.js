@@ -398,95 +398,207 @@ browser.runtime
                     });
                 }
 
-                const width =
-                    captchaImage.naturalWidth || captchaImage.width || 150;
-                const height =
-                    captchaImage.naturalHeight || captchaImage.height || 50;
+                const rawW =
+                    captchaImage.naturalWidth || captchaImage.width || 122;
+                const rawH =
+                    captchaImage.naturalHeight || captchaImage.height || 31;
 
-                const canvas = document.createElement("canvas");
-                const ctx = canvas.getContext("2d", { willReadFrequently: true });
-                canvas.width = width;
-                canvas.height = height;
-                ctx.drawImage(captchaImage, 0, 0, width, height);
+                const tempCanvas = document.createElement("canvas");
+                const tempCtx = tempCanvas.getContext("2d", {
+                    willReadFrequently: true,
+                });
+                tempCanvas.width = rawW;
+                tempCanvas.height = rawH;
+                tempCtx.drawImage(captchaImage, 0, 0, rawW, rawH);
 
-                // Preprocessing: Thresholding + Dilation + Median Filter
-                const imgData = ctx.getImageData(0, 0, width, height);
-                const pixelData = imgData.data;
+                const imgData = tempCtx.getImageData(0, 0, rawW, rawH);
+                const data = imgData.data;
 
-                const darknessThreshold = 140;
-                for (let i = 0; i < pixelData.length; i += 4) {
-                    const r = pixelData[i],
-                        g = pixelData[i + 1],
-                        b = pixelData[i + 2];
-                    const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
-                    const isText = luminance < darknessThreshold;
-                    pixelData[i] =
-                        pixelData[i + 1] =
-                        pixelData[i + 2] =
-                            isText ? 0 : 255;
-                    pixelData[i + 3] = 255;
+                // 1. Threshold: isolate dark character strokes from light pastel background
+                const lumThresh = 135;
+                const binary = new Uint8Array(rawW * rawH);
+                for (let y = 0; y < rawH; y++) {
+                    for (let x = 0; x < rawW; x++) {
+                        const idx = (y * rawW + x) * 4;
+                        const r = data[idx];
+                        const g = data[idx + 1];
+                        const b = data[idx + 2];
+                        const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+                        binary[y * rawW + x] = lum < lumThresh ? 1 : 0;
+                    }
                 }
 
-                // Dilation (thickening characters)
-                const thickenedData = new Uint8ClampedArray(pixelData.length);
-                for (let i = 0; i < pixelData.length; i += 4) {
-                    thickenedData[i + 3] = 255;
-                    if (pixelData[i] === 0) {
-                        thickenedData[i] =
-                            thickenedData[i + 1] =
-                            thickenedData[i + 2] =
-                                0;
-                        continue;
+                // 2. Horizontal noise line removal (erases 1px & 2px thin horizontal strokes)
+                const cleaned = new Uint8Array(binary);
+                for (let y = 1; y < rawH - 1; y++) {
+                    for (let x = 0; x < rawW; x++) {
+                        const idx = y * rawW + x;
+                        if (
+                            binary[idx] === 1 &&
+                            binary[(y - 1) * rawW + x] === 0 &&
+                            binary[(y + 1) * rawW + x] === 0
+                        ) {
+                            cleaned[idx] = 0;
+                        }
+                        if (
+                            y < rawH - 2 &&
+                            binary[idx] === 1 &&
+                            binary[(y + 1) * rawW + x] === 1 &&
+                            binary[(y - 1) * rawW + x] === 0 &&
+                            binary[(y + 2) * rawW + x] === 0
+                        ) {
+                            cleaned[idx] = 0;
+                            cleaned[(y + 1) * rawW + x] = 0;
+                        }
                     }
-                    let isNeighborBlack = false;
-                    const x = (i / 4) % width;
-                    const y = Math.floor(i / 4 / width);
-                    for (let j = -1; j <= 1; j++) {
-                        for (let k = -1; k <= 1; k++) {
-                            if (j === 0 && k === 0) continue;
-                            const nX = x + k,
-                                nY = y + j;
-                            if (nX >= 0 && nX < width && nY >= 0 && nY < height) {
-                                if (pixelData[(nY * width + nX) * 4] === 0) {
-                                    isNeighborBlack = true;
-                                    break;
+                }
+
+                // 3. Vertical reconnection: restores any 1px vertical character cuts from line removal
+                const reconnected = new Uint8Array(cleaned);
+                for (let y = 1; y < rawH - 1; y++) {
+                    for (let x = 0; x < rawW; x++) {
+                        if (
+                            cleaned[(y - 1) * rawW + x] === 1 &&
+                            cleaned[(y + 1) * rawW + x] === 1
+                        ) {
+                            reconnected[y * rawW + x] = 1;
+                        }
+                    }
+                }
+
+                // 4. Connected-component analysis: extract characters, filter out noise specks (< 20px)
+                const minCompSize = 20;
+                const visited = new Uint8Array(rawW * rawH);
+                const charComps = [];
+                const queue = new Int32Array(rawW * rawH * 2);
+
+                for (let y = 0; y < rawH; y++) {
+                    for (let x = 0; x < rawW; x++) {
+                        const startIdx = y * rawW + x;
+                        if (
+                            reconnected[startIdx] === 1 &&
+                            visited[startIdx] === 0
+                        ) {
+                            let head = 0,
+                                tail = 0;
+                            queue[tail++] = x;
+                            queue[tail++] = y;
+                            visited[startIdx] = 1;
+
+                            const comp = [[x, y]];
+
+                            while (head < tail) {
+                                const cx = queue[head++];
+                                const cy = queue[head++];
+
+                                for (let dy = -1; dy <= 1; dy++) {
+                                    for (let dx = -1; dx <= 1; dx++) {
+                                        if (dx === 0 && dy === 0) continue;
+                                        const nx = cx + dx;
+                                        const ny = cy + dy;
+                                        if (
+                                            nx >= 0 &&
+                                            nx < rawW &&
+                                            ny >= 0 &&
+                                            ny < rawH
+                                        ) {
+                                            const nIdx = ny * rawW + nx;
+                                            if (
+                                                visited[nIdx] === 0 &&
+                                                reconnected[nIdx] === 1
+                                            ) {
+                                                visited[nIdx] = 1;
+                                                queue[tail++] = nx;
+                                                queue[tail++] = ny;
+                                                comp.push([nx, ny]);
+                                            }
+                                        }
+                                    }
                                 }
                             }
-                        }
-                        if (isNeighborBlack) break;
-                    }
-                    thickenedData[i] =
-                        thickenedData[i + 1] =
-                        thickenedData[i + 2] =
-                            isNeighborBlack ? 0 : 255;
-                }
 
-                // Median Filter for noise reduction
-                const finalPixelData = new Uint8ClampedArray(pixelData.length);
-                for (let i = 0; i < pixelData.length; i += 4) {
-                    const x = (i / 4) % width;
-                    const y = Math.floor(i / 4 / width);
-                    const neighbors = [];
-                    for (let j = -1; j <= 1; j++) {
-                        for (let k = -1; k <= 1; k++) {
-                            const nX = x + k,
-                                nY = y + j;
-                            if (nX >= 0 && nX < width && nY >= 0 && nY < height) {
-                                neighbors.push(thickenedData[(nY * width + nX) * 4]);
+                            if (comp.length >= minCompSize) {
+                                let minX = rawW;
+                                for (let i = 0; i < comp.length; i++) {
+                                    if (comp[i][0] < minX) minX = comp[i][0];
+                                }
+                                charComps.push({ minX, comp });
                             }
                         }
                     }
-                    neighbors.sort((a, b) => a - b);
-                    const medianValue =
-                        neighbors[Math.floor(neighbors.length / 2)];
-                    finalPixelData[i] =
-                        finalPixelData[i + 1] =
-                        finalPixelData[i + 2] =
-                            medianValue;
-                    finalPixelData[i + 3] = 255;
                 }
-                ctx.putImageData(new ImageData(finalPixelData, width, height), 0, 0);
 
+                // Sort character components from left to right
+                charComps.sort((a, b) => a.minX - b.minX);
+
+                // 5. Render characters with 3x scale, clean spacing, and white padding for Tesseract
+                const scale = 3;
+                const charGap = 20;
+                const pad = 20;
+
+                let totalW = pad * 2;
+                if (charComps.length > 0) {
+                    for (const { comp } of charComps) {
+                        let cMinX = rawW,
+                            cMaxX = 0;
+                        for (let i = 0; i < comp.length; i++) {
+                            if (comp[i][0] < cMinX) cMinX = comp[i][0];
+                            if (comp[i][0] > cMaxX) cMaxX = comp[i][0];
+                        }
+                        totalW += (cMaxX - cMinX + 1) * scale + charGap;
+                    }
+                } else {
+                    totalW = rawW * scale + pad * 2;
+                }
+
+                const totalH = rawH * scale + pad * 2;
+                const outCanvas = document.createElement("canvas");
+                outCanvas.width = totalW;
+                outCanvas.height = totalH;
+                const outCtx = outCanvas.getContext("2d");
+                outCtx.fillStyle = "#FFFFFF";
+                outCtx.fillRect(0, 0, totalW, totalH);
+
+                if (charComps.length > 0) {
+                    let currX = pad;
+                    for (const { comp } of charComps) {
+                        let cMinX = rawW,
+                            cMaxX = 0;
+                        for (let i = 0; i < comp.length; i++) {
+                            if (comp[i][0] < cMinX) cMinX = comp[i][0];
+                            if (comp[i][0] > cMaxX) cMaxX = comp[i][0];
+                        }
+                        outCtx.fillStyle = "#000000";
+                        for (let i = 0; i < comp.length; i++) {
+                            const rx = comp[i][0];
+                            const ry = comp[i][1];
+                            outCtx.fillRect(
+                                currX + (rx - cMinX) * scale,
+                                pad + ry * scale,
+                                scale,
+                                scale
+                            );
+                        }
+                        currX += (cMaxX - cMinX + 1) * scale + charGap;
+                    }
+                } else {
+                    // Fallback render of cleaned pixels
+                    outCtx.fillStyle = "#000000";
+                    for (let y = 0; y < rawH; y++) {
+                        for (let x = 0; x < rawW; x++) {
+                            if (cleaned[y * rawW + x] === 1) {
+                                outCtx.fillRect(
+                                    pad + x * scale,
+                                    pad + y * scale,
+                                    scale,
+                                    scale
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // 6. Run local Tesseract WebAssembly OCR
                 let worker;
                 try {
                     worker = await Tesseract.createWorker("eng");
@@ -497,15 +609,15 @@ browser.runtime
                     });
                     const {
                         data: { text },
-                    } = await worker.recognize(canvas);
-                    let cleaned = (text || "")
+                    } = await worker.recognize(outCanvas);
+                    let cleanedText = (text || "")
                         .trim()
                         .replace(/[^a-zA-Z0-9]/g, "")
                         .toUpperCase();
-                    if (cleaned.length > 6) {
-                        cleaned = cleaned.substring(0, 6);
+                    if (cleanedText.length > 6) {
+                        cleanedText = cleanedText.substring(0, 6);
                     }
-                    return cleaned;
+                    return cleanedText;
                 } finally {
                     if (worker) {
                         await worker.terminate();
