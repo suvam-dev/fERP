@@ -1,5 +1,5 @@
 /**
- * fERP - Neutral Feedback Script for IIT Kharagpur ERP
+ * fERP v2.0 - Neutral Feedback Script for IIT Kharagpur ERP
  * Compatible with both the updated ERP feedback portal and the legacy portal.
  */
 (function () {
